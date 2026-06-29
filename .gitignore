@@ -1,0 +1,8 @@
+.env
+faiss_index/
+__pycache__/
+venv/
+*.pyc
+eka.log
+eval/eval_report.json
+.DS_Store
