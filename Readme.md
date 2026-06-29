@@ -1,222 +1,240 @@
 # Enterprise Knowledge Assistant
 
-A RAG system for answering employee questions over internal documents (HR policy, product docs, customer FAQs, etc.) with cited sources and a confidence score. Two front ends — a Streamlit chat UI and a FastAPI `/ask` endpoint — share one retrieval/generation core (`rag_core.py`).
+A production-oriented Retrieval Augmented Generation (RAG) assistant for asking questions over internal PDF documents. The app supports PDF upload, text extraction, indexing, hybrid retrieval, cited answers, confidence scoring, a Streamlit chat UI, and an optional FastAPI endpoint.
 
-## Contents
+## Features
 
-- [Architecture](#architecture)
-- [Setup](#setup)
-- [Running it](#running-it)
-- [Design decisions](#design-decisions)
-- [Evaluation](#evaluation)
-- [Known limitations](#known-limitations)
-- [Future improvements](#future-improvements)
+- Upload one or more PDF documents from the Streamlit sidebar.
+- Extract page-level text and table rows using `pdfplumber`, with `PyPDF2` fallback.
+- Chunk documents with metadata for source document and page number.
+- Build a persistent FAISS dense vector index and a BM25 sparse keyword corpus.
+- Retrieve with hybrid search: dense semantic search plus BM25 keyword search.
+- Fuse rankings with weighted Reciprocal Rank Fusion.
+- Reduce duplicate context with MMR reranking.
+- Generate concise answers with source references.
+- Return confidence scores based on retrieval quality and answer support.
+- Expose the same RAG core through both Streamlit and FastAPI.
 
 ## Architecture
 
-```
-                         ┌─────────────────────┐
-   PDF uploads  ───────► │  Ingestion           │
-                         │  pdfplumber→PyPDF2   │
-                         │  fallback, per-page  │
-                         │  text + table rows   │
-                         └──────────┬───────────┘
-                                    │
-                         ┌──────────▼───────────┐
-                         │  Chunking             │
-                         │  RecursiveCharacter   │
-                         │  Splitter, 800/150    │
-                         └──────────┬───────────┘
-                                    │
-                  ┌─────────────────┴─────────────────┐
-                  ▼                                     ▼
-        ┌──────────────────┐                 ┌──────────────────┐
-        │ FAISS (dense)     │                 │ BM25 (sparse)     │
-        │ MiniLM-L6-v2       │                 │ rank_bm25         │
-        │ embeddings         │                 │ keyword index     │
-        └─────────┬────────┘                 └─────────┬────────┘
-                  │ top-8                                │ top-8
-                  └────────────────┬────────────────────┘
-                                   ▼
-                       ┌───────────────────────┐
-                       │ Reciprocal Rank Fusion │
-                       │ (rank-based, no score  │
-                       │  normalisation needed) │
-                       └───────────┬───────────┘
-                                   │ top-8
-                                   ▼
-                       ┌───────────────────────┐
-                       │ MMR diversity rerank   │
-                       │ (drops near-duplicate  │
-                       │  overlapping chunks)   │
-                       └───────────┬───────────┘
-                                   │ top-4
-                                   ▼
-                       ┌───────────────────────┐
-                       │ Prompt assembly        │
-                       │ (context + history +   │
-                       │  question)             │
-                       └───────────┬───────────┘
-                                   ▼
-                       ┌───────────────────────┐
-                       │ LLM (OpenRouter free   │
-                       │  tier) via LangChain   │
-                       └───────────┬───────────┘
-                                   ▼
-                  answer + sources[] + confidence
-                                   │
-                  ┌────────────────┴────────────────┐
-                  ▼                                   ▼
-          Streamlit chat UI                    FastAPI POST /ask
-          (chat_pdf.py)                        (api.py)
+```text
+PDF Uploads
+    |
+    v
+Document Extraction
+pdfplumber + PyPDF2 fallback
+page text + table rows
+    |
+    v
+Chunking
+RecursiveCharacterTextSplitter
+1100 chars / 220 overlap
+source + page metadata
+    |
+    +-------------------------+
+    |                         |
+    v                         v
+FAISS Dense Index         BM25 Sparse Corpus
+Sentence Transformers     rank-bm25
+semantic retrieval        keyword retrieval
+top 24 candidates         top 24 candidates
+    |                         |
+    +-----------+-------------+
+                |
+                v
+Weighted Reciprocal Rank Fusion
+top 16 fused candidates
+                |
+                v
+Near-Duplicate Removal + MMR Reranking
+top 5 context chunks
+                |
+                v
+Prompt Assembly
+context + chat history + question
+                |
+                v
+OpenRouter Chat Model
+                |
+                v
+Answer + Sources + Confidence
+                |
+        +-------+-------+
+        v               v
+Streamlit UI       FastAPI /ask
 ```
 
-`rag_core.py` owns every step above this line. `api.py` and `chat_pdf.py` are thin adapters — HTTP schema/status codes on one side, Streamlit widgets on the other — that both call `rag_core.answer_question()`. Originally these were two copies of the same pipeline; they're now one implementation with two front doors, which is the only sane way to keep retrieval behavior consistent between them.
+`rag_core.py` owns the full RAG pipeline. `chat_pdf.py` is only the Streamlit interface, and `api.py` is only the HTTP interface. This keeps retrieval and answer behavior consistent across both entry points.
 
 ## Setup
 
+Use Python 3.11 or newer.
+
 ```bash
-git clone <repo-url> && cd <repo>
-python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+python -m venv venv
+venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill in OPENROUTER_API_KEY
 ```
 
-`.env`:
+Create a `.env` file:
+
+```env
+OPENROUTER_API_KEY=sk-or-v1-your-key
 ```
-OPENROUTER_API_KEY=sk-or-v1-...
+
+You can use any OpenRouter-compatible model by setting:
+
+```env
+EKA_LLM_MODEL=openrouter/free
 ```
 
-Get a free key at [openrouter.ai/keys](https://openrouter.ai/keys) — no card required for the free tier.
+## Run The Streamlit App
 
-Optional overrides (all have working defaults, see `rag_core.py` config block):
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `EKA_LLM_MODEL` | `openrouter/free` | Model id passed to OpenRouter |
-| `EKA_FAISS_INDEX_PATH` | `faiss_index` | Where the dense+sparse index is persisted |
-| `EKA_TOP_K_FINAL` | `4` | Chunks sent to the LLM after rerank |
-| `EKA_CHUNK_SIZE` / `EKA_CHUNK_OVERLAP` | `800` / `150` | Chunking params |
-| `EKA_LOG_FILE` | `eka.log` | Log file path |
-
-## Running it
-
-**Streamlit UI:**
 ```bash
 streamlit run chat_pdf.py
 ```
-Upload PDFs in the sidebar, click "Process Documents", then ask questions in the chat box.
 
-**FastAPI:**
+Then:
+
+1. Upload PDF files in the sidebar.
+2. Click the process/index button.
+3. Ask questions in the chat input.
+4. Open the sources expander to inspect source document and page references.
+
+## Run The API
+
 ```bash
 uvicorn api:app --reload
 ```
+
+Health check:
+
 ```bash
-curl -X POST localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is the refund policy?"}'
+curl http://localhost:8000/health
 ```
+
+Ask a question:
+
+```bash
+curl -X POST http://localhost:8000/ask ^
+  -H "Content-Type: application/json" ^
+  -d "{\"question\":\"What is the refund policy?\"}"
+```
+
+Example response:
+
 ```json
 {
-  "answer": "Refunds are allowed within 30 days of purchase, provided the product is unused and in original packaging.",
-  "sources": [{"document": "Customer_Policy.pdf", "page": 1}],
-  "confidence": 0.87,
-  "retrieved_chunks": 4,
+  "answer": "Refunds are allowed within 30 days. [Chunk 1]",
+  "sources": [
+    {
+      "document": "Customer_Policy.pdf",
+      "page": 5
+    }
+  ],
+  "confidence": 0.91,
+  "retrieved_chunks": 5,
   "latency_ms": 1840
 }
 ```
-`GET /health` reports index readiness and document count. Both UIs share whatever index exists in `EKA_FAISS_INDEX_PATH` — index once via Streamlit, query via either interface.
 
-**Note:** the Streamlit UI and the API process don't share Python memory, only the on-disk index. If you index documents through Streamlit and then immediately hit the API in a separate process, the API will pick up the index from disk on its next request — there's no live cache invalidation needed since each request loads fresh from `faiss_index/`.
+## Configuration
 
-## Design decisions
+All settings are optional and can be overridden with environment variables.
 
-### Chunking: 800 chars / 150 overlap, `RecursiveCharacterTextSplitter`
-Most policy/FAQ paragraphs in the target document types (HR policy, product docs) run 150–400 words. 800 characters keeps a chunk to roughly one self-contained clause or sub-section without dragging in the next unrelated topic. 150-char overlap (~19%) is enough that a sentence split across a chunk boundary still appears whole in at least one chunk, without bloating the index. The splitter's separator hierarchy (`\n\n` → `\n` → `. ` → ` `) tries to break on paragraph/sentence boundaries before falling back to a hard character cut.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `EKA_LLM_MODEL` | `openrouter/free` | OpenRouter chat model |
+| `EKA_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local embedding model |
+| `EKA_FAISS_INDEX_PATH` | `faiss_index` | Persistent index directory |
+| `EKA_TOP_K_DENSE` | `24` | Dense candidates from FAISS |
+| `EKA_TOP_K_SPARSE` | `24` | Sparse candidates from BM25 |
+| `EKA_TOP_K_FUSED` | `16` | Candidates after rank fusion |
+| `EKA_TOP_K_FINAL` | `5` | Chunks sent to the LLM |
+| `EKA_CHUNK_SIZE` | `1100` | Chunk size in characters |
+| `EKA_CHUNK_OVERLAP` | `220` | Chunk overlap in characters |
+| `EKA_LOG_FILE` | `eka.log` | Log file path |
 
-This is a static, content-agnostic choice — it isn't tuned per document type. A compliance document with long enumerated clauses or a technical manual with code blocks would likely want different chunk boundaries (see [Future improvements](#future-improvements)).
+## Design Decisions
 
-### Embeddings: `sentence-transformers/all-MiniLM-L6-v2`, local
-Runs on CPU, no API cost or rate limit, 384-dim (small index footprint), and is the standard baseline for short-passage retrieval. Quality is a step below OpenAI's `text-embedding-3` family on some benchmarks, but for paragraph-length internal-doc chunks the gap is small relative to what hybrid retrieval (below) buys back. Embedding locally also means indexing doesn't depend on the same API key/quota as generation.
+### Chunking
 
-### Hybrid retrieval: FAISS (dense) + BM25 (sparse), fused with RRF
-Pure dense retrieval misses exact-term queries — a question like "what is the INR 500 receipt threshold" benefits from keyword matching on "500" and "receipt" as much as from semantic similarity. BM25 (via `rank_bm25`) runs independently over the same chunk corpus and is fused with the FAISS results using **Reciprocal Rank Fusion**: `score(chunk) = Σ 1/(k + rank)` across whichever lists contain it, `k=60`.
+The app uses `RecursiveCharacterTextSplitter` with 1100-character chunks and 220-character overlap. This keeps policy or FAQ sections large enough to preserve context while still small enough for precise retrieval. The overlap helps preserve sentences that cross chunk boundaries.
 
-RRF was chosen over weighted score averaging because BM25 scores and cosine similarities live on incomparable scales — RRF only needs each list's *rank order*, sidestepping a score-normalization problem that has no principled answer (there's no natural way to say a BM25 score of 5.2 is "worth" a cosine similarity of 0.3).
+### Embeddings
 
-### Reranking: MMR (Maximal Marginal Relevance), not a cross-encoder
-After fusion, the top-8 fused candidates go through MMR (`λ=0.5`, balancing relevance against diversity) to cut down to the final top-4 sent to the LLM. The fused list often contains 2–3 chunks that are really the same clause repeated across overlapping chunk boundaries — MMR penalizes picking a chunk too similar to one already selected, so the final context window covers more distinct ground instead of three slightly different windows onto the same sentence.
+The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`. It runs locally on CPU, avoids embedding API costs, and is fast enough for a take-home assignment or small internal document collection. A stronger model can be configured with `EKA_EMBEDDING_MODEL`.
 
-A cross-encoder reranker (e.g. `ms-marco-MiniLM`) would likely give better *relevance* ranking, but it's a second model load and a real inference-time cost for marginal gain on this corpus size and query complexity — MMR using the embeddings already computed for FAISS was the cheaper choice that still addresses the actual problem (redundant chunks), not relevance ranking per se. Worth revisiting if eval shows precision issues that diversity alone doesn't fix.
+### Hybrid Retrieval
 
-### Confidence score: derived from real retrieval similarity, not keyword overlap
-The original implementation scored confidence by counting how many query words appeared verbatim in the retrieved chunk text — a string-matching heuristic dressed up as a confidence number, with no relationship to what the embedding model or LLM actually "thought." It rewarded keyword-stuffed chunks and didn't move when retrieval was genuinely uncertain.
+Dense retrieval is good for semantic matches, while BM25 is better for exact terms such as policy names, acronyms, numbers, and product codes. The system retrieves from both FAISS and BM25, then combines the ranked lists with weighted Reciprocal Rank Fusion.
 
-`compute_confidence()` now uses the **mean cosine similarity** (FAISS's normalized relevance score) across the final retrieved chunks, plus a small bonus (`+0.1 × fraction agreeing`) when a chunk was independently surfaced by *both* dense and sparse retrieval — agreement between two different retrieval signals is a real corroborating signal, disagreement isn't penalized but also doesn't help. Capped at 0.99: a generative system answering from retrieved text should never claim full certainty.
+### Reranking
 
-This is still a retrieval-confidence proxy, not an answer-correctness probability — see [Known limitations](#known-limitations).
+After fusion, near-duplicate chunks are removed and Maximal Marginal Relevance reranking selects a diverse final context. This prevents the LLM from receiving several overlapping chunks that all say the same thing.
 
-### Prompt design
-The system prompt is constrained ("answer ONLY from context," explicit refusal string, "don't fabricate page numbers") and asks for inline `[Chunk N]` references so an answer's claims can be traced back to a specific context block during eval/debugging. Conversation history (last `MAX_HISTORY_TURNS=6` exchanges) is folded into the prompt as plain text rather than via the LLM's structured `messages` history, mainly because both the original chunk-citation behavior and ambiguity-handling rule needed to live in one place a reviewer could read top to bottom.
+### Prompting
 
-### Why `openrouter/free` instead of a pinned model
-`openrouter/free` is OpenRouter's auto-router across whatever free models are currently available — which means the actual model behind a given call isn't fixed and can change run to run. This is a known instability (a grader hitting the API twice could get two different underlying models). It was kept as-is for this submission rather than pinned to a specific free model id, to avoid depending on a specific free-tier model's continued availability at evaluation time — pinning trades "consistent behavior now" for "guaranteed to break later when that specific free model gets deprecated or rate-limited out from under the submission." `EKA_LLM_MODEL` is exposed as an env var specifically so this can be pinned in one place without touching code, if a grading environment needs deterministic behavior more than free-tier resilience.
+The prompt instructs the model to answer only from retrieved context, cite facts with `[Chunk N]`, avoid invented information, and use a fixed refusal when the answer is not supported by the documents.
 
-### Error handling & logging
-`rag_core.py` defines a small exception hierarchy (`InvalidQuestionError`, `IndexNotFoundError`, `LLMConfigError`, `LLMGenerationError`, `EmptyDocumentError`) so each failure mode is distinguishable. `api.py` maps these to HTTP status codes (400 for bad input, 503 for no index yet, 502 for upstream LLM failure, 500 for config errors) instead of a blanket 500, and a global exception handler ensures an unhandled error returns a clean JSON body instead of a stack trace. `chat_pdf.py` catches the same hierarchy and shows a UI message rather than crashing the Streamlit session. Everything logs through a single configured logger (console + `eka.log`) with retrieval counts, latency, and confidence per query — useful for spotting silent retrieval failures (e.g. an index that loads but returns zero hits) that wouldn't otherwise surface as an "error."
+### Confidence
 
-### Scalability considerations
-- FAISS here uses the default flat (exhaustive) index — fine up to roughly tens of thousands of chunks; beyond that, swap to `IndexIVFFlat` or `IndexHNSWFlat` for sub-linear search.
-- BM25 is rebuilt in memory from a JSON corpus file on every query. That's a deliberate simplicity-over-throughput choice for a take-home-sized corpus (rebuild is sub-second up to a few thousand chunks); at real "hundreds of documents" scale this should move to a persisted BM25 structure or be replaced by a proper search engine (Elasticsearch/OpenSearch) so indexing cost is paid once, not per query.
-- The embedding model and vector store are process-global singletons — fine for a single-process deployment, not for horizontal scaling without an external vector DB (Pinecone/Weaviate/managed FAISS service) that multiple API replicas can share.
-- No request queueing/concurrency limiting on `/ask` — under load, concurrent requests each pay full embedding + BM25 rebuild + LLM round-trip cost. A production version would cache embeddings for repeated queries and put a queue or concurrency cap in front of the LLM call.
+Confidence is a retrieval-quality estimate. It uses dense similarity, sparse keyword support, dense/sparse agreement, source diversity, query-variant coverage, and answer-aware checks. If the answer says the information was not found, confidence is intentionally low.
 
-## Evaluation
+## Evaluation Approach
 
-See `eval/` — a self-contained harness with its own sample corpus (so grading isn't reliant on a particular runtime's already-built index):
+For this assignment, evaluate the system with a small set of representative PDFs and questions:
 
-```bash
-python eval/build_sample_pdfs.py     # generates 2 sample PDFs with known page boundaries
-python eval/index_sample_docs.py     # builds a fresh FAISS+BM25 index from them
-python eval/run_eval.py              # runs 12 test cases against the live pipeline
-```
+| Case Type | Example | Expected Check |
+|---|---|---|
+| Direct fact lookup | "What is the employee leave policy?" | Correct answer and correct source page |
+| Exact term lookup | "What is the refund period?" | BM25 retrieves exact policy wording |
+| Multi-document question | "Compare onboarding and support escalation steps." | Sources include all relevant documents |
+| Ambiguous question | "What is the policy?" | Answer notes ambiguity or uses available context carefully |
+| Unanswerable question | "What is the CEO's home address?" | System refuses instead of hallucinating |
 
-**Test cases** (`eval/test_cases.json`, 12 total): factual lookups (single fact, single source — the two examples are the assignment brief's own canonical questions), a multi-document reasoning case (forces retrieval to pull from both sample PDFs), an ambiguously-worded question, and two deliberately unanswerable questions (one adjacent to real content, one unrelated) to test refusal rather than hallucination.
+Suggested metrics:
 
-**Metrics computed per case and aggregated:**
-- **Precision@k / Recall@k** — of the chunks retrieved, how many match the expected `(document, page)`; of the expected sources, how many were found
-- **MRR** — rank of the first correct source (rewards getting it right *early*, not just eventually)
-- **Keyword coverage** — fraction of expected key facts (e.g. `"24"`, `"30 days"`) present in the generated answer; a cheap proxy for answer correctness that doesn't require a second LLM-as-judge call (see limitations)
-- **Hallucination resistance rate** — for the unanswerable cases, did the system correctly refuse instead of inventing an answer
-- **Latency, self-reported confidence** — for spotting regressions, not absolute targets
+- Retrieval Recall@5: whether the expected source page appears in the final sources.
+- Source precision: whether returned sources are relevant.
+- Answer coverage: whether key expected facts appear in the answer.
+- Hallucination resistance: whether unsupported questions receive the refusal response.
+- Latency: time returned in `latency_ms`.
+- Confidence sanity: high for supported answers, low for refusals.
 
-Pass/fail thresholds (`recall ≥ 0.5` and `coverage ≥ 0.5` for answerable cases; correct refusal for unanswerable ones) are deliberately lenient given the free, auto-routed LLM — the harness is built to catch regressions across changes to the pipeline, not to certify a specific accuracy number against a non-deterministic backend.
+## Assignment Coverage
 
-**Improvements made during evaluation-driven iteration** (see git history / commit messages for the actual before/after):
-- The original confidence score (keyword-overlap ratio) didn't correlate with retrieval quality at all — replaced with the cosine-similarity-based version above.
-- The original MMR-equivalent tuning (`λ=0.6`) under-weighted diversity in testing — near-duplicate chunks from overlapping chunk windows kept winning over genuinely distinct, still-relevant chunks. Lowered to `λ=0.5`.
-- Confirmed via unit-level tests (not just the eval harness) that RRF correctly promotes a chunk found by *both* dense and sparse retrieval above one found by only one — this is the behavior hybrid search is supposed to buy, and it's easy to get backwards with a careless score-combination formula.
+| Requirement | Implementation |
+|---|---|
+| Document ingestion | Streamlit PDF uploader |
+| Text extraction | `pdfplumber` with `PyPDF2` fallback |
+| Chunking and metadata | `chunk_pages()` in `rag_core.py` |
+| Embeddings | Sentence Transformers |
+| Searchable index | FAISS plus persisted BM25 corpus |
+| Semantic search | FAISS similarity search |
+| Hybrid search bonus | FAISS + BM25 + RRF |
+| Reranking bonus | MMR reranking |
+| Conversation memory bonus | Recent chat history included in prompt and retrieval expansion |
+| Source citation | Document and page returned in UI/API |
+| UI | Streamlit chat app |
+| API preferred | FastAPI `/ask` and `/health` |
+| Documentation | README plus `SYSTEM_DESIGN.md` |
 
-## Known limitations
+## Known Limitations
 
-- **Model nondeterminism.** `openrouter/free` auto-routes to whatever free model is currently available; answer phrasing and occasionally answer quality will vary run to run, independent of anything in this codebase. Pin `EKA_LLM_MODEL` to a specific id for reproducible grading.
-- **Keyword-coverage isn't correctness.** The eval harness checks whether expected phrases appear in the answer text, not whether the answer is semantically correct or doesn't contradict itself elsewhere. A proper answer-quality eval would use an LLM-as-judge pass (e.g. RAGAS's faithfulness/answer-relevance metrics) — not implemented here to avoid spending the same scarce free-tier LLM quota on grading its own output.
-- **Confidence is a retrieval-quality proxy, not a calibrated probability.** "0.87 confidence" means "the retrieved chunks were strongly similar to the query," not "there's an 87% chance this answer is correct." It will be high even for a well-retrieved chunk that the LLM nonetheless summarizes incorrectly.
-- **Scanned/image-only PDFs aren't handled.** Both extractors (`pdfplumber`, `PyPDF2`) require a text layer; no OCR fallback exists. The UI surfaces this as a clear error rather than silently returning nothing, but it's still a hard limitation, not a fallback.
-- **BM25 corpus is rebuilt in memory per query** rather than persisted as a queryable structure — fine at this corpus scale, not at "hundreds of documents."
-- **No authentication.** `/ask` is open; CORS defaults to `*`. Fine for a take-home, not for a real internal deployment.
-- **No query rewriting.** A genuinely ambiguous or underspecified question (e.g. "what's the policy?" with no other context) is retrieved as-is; there's no reformulation step that uses conversation history to disambiguate the retrieval query itself (history is only used in the final generation prompt).
-- **Single-process, single-machine.** No shared cache or vector DB across replicas; see [Scalability considerations](#scalability-considerations).
+- Scanned image-only PDFs are not OCR processed.
+- `openrouter/free` can route to different free models, so generated wording may vary.
+- Confidence is not a calibrated probability of correctness.
+- The local FAISS/BM25 setup is suitable for small to medium document sets, not multi-tenant enterprise scale.
+- There is no authentication or document-level access control.
+- The API and Streamlit app share the on-disk index, not in-memory state.
 
-## Future improvements
+## Future Improvements
 
-Roughly in order of expected value for the effort:
-
-1. **Query rewriting using conversation history** — fold prior turns into the *retrieval* query (not just the generation prompt) so a follow-up like "what about for managers?" retrieves correctly instead of relying on the raw follow-up text alone.
-2. **LLM-as-judge answer evaluation** (RAGAS-style faithfulness/relevance scoring) to replace the keyword-coverage proxy with something closer to actual correctness.
-3. **Cross-encoder reranking** as an option alongside MMR, switchable via config, for corpora/queries where pure embedding-similarity reranking under-performs.
-4. **Content-aware chunking** — different chunk strategies for tabular/structured sections (already partially handled via `pdfplumber` table extraction) versus narrative prose versus enumerated clauses.
-5. **Persisted, queryable sparse index** (replace the per-query in-memory BM25 rebuild) once corpus size moves past a few thousand chunks.
-6. **User feedback collection** — a thumbs up/down on each answer, logged against the question/sources/confidence, to build a real eval set from production traffic instead of synthetic test cases.
-7. **Auth + per-document access control** — relevant the moment this touches anything beyond a single team's non-sensitive docs.
-8. **OCR fallback** for scanned PDFs (e.g. via `pytesseract`) so image-only documents don't silently fail ingestion.
+- Add OCR for scanned PDFs.
+- Add a formal automated evaluation harness with stored test cases.
+- Add cross-encoder reranking for higher precision.
+- Add user feedback on answers.
+- Add authentication and per-document permissions.
+- Move FAISS/BM25 to a managed vector database/search service for horizontal scaling.
+- Pin a deterministic production LLM instead of `openrouter/free`.

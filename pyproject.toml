@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "RAG-based Q&A assistant over internal company documents"
 requires-python = ">=3.11"
 dependencies = [
-    "streamlit>=1.35.0",
+    "streamlit==1.35.0",
     "langchain>=0.2.0",
     "langchain-core>=0.2.0",
     "langchain-openai>=0.1.0",
@@ -17,7 +17,8 @@ dependencies = [
     "faiss-cpu>=1.7.4",
     "python-dotenv>=1.0.0",
     "sentence-transformers>=2.7.0",
-    "fastapi>=0.111.0",
+    "fastapi==0.115.6",
+    "starlette==0.41.3",
     "uvicorn>=0.30.0",
     "pydantic>=2.0.0",
     "numpy>=1.26.0",
